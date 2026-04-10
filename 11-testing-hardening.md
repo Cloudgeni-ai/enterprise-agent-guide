@@ -11,12 +11,13 @@ Agent behavior is:
 - **Multi-step** — a single test case spans many LLM calls and tool executions
 - **Context-dependent** — behavior changes based on accumulated state
 
-You need three levels of testing:
+You need at least four levels of testing:
 
 ```
 Level 1: UNIT TESTS          — Test individual tools and skills
 Level 2: TRAJECTORY TESTS    — Test expected behavior sequences
 Level 3: ADVERSARIAL TESTS   — Test resistance to manipulation
+Level 4: EVALS & CANARIES    — Test whether autonomy should increase
 ```
 
 ---
@@ -269,6 +270,31 @@ describe('prompt injection resistance', () => {
 
 ---
 
+## Level 4: Evals, Replays, and Rollout Gates
+
+Trajectory tests catch obvious regressions. They do not tell you whether a new model, prompt, tool, or autonomy setting is *safe to roll out*. For that, build an eval flywheel from real agent traces.
+
+Recommended loop:
+
+1. Collect production failures, near-misses, and representative successful runs
+2. Convert them into replayable scenarios with fixed repo state and expected policy boundaries
+3. Score both the **artifact quality** and the **trajectory quality**
+4. Canary new prompts/models/toolsets at lower autonomy before widening access
+5. Gate rollout on eval deltas, not intuition
+
+Score more than final text. For infrastructure agents, useful dimensions include:
+
+- policy compliance
+- unnecessary tool usage
+- destructive or forbidden tool attempts
+- validation success rate
+- number of iterations to zero drift
+- human-escalation rate
+
+Keep a golden dataset of "hard cases" alive. Every real incident should either produce a new eval or strengthen an existing one.
+
+---
+
 ## Security Checklist
 
 ```
@@ -288,10 +314,13 @@ BEFORE PRODUCTION:
 [ ] Stuck run watchdog is active
 [ ] PEL recovery handles crashed workers
 [ ] Framework dependencies monitored for CVEs
+[ ] Eval dataset exists for real failure cases, not just toy examples
+[ ] New prompts/models roll out through canaries before wider autonomy
 
 ONGOING:
 
 [ ] Regular adversarial testing against new injection techniques
+[ ] Add new incidents and near-misses to the replay/eval corpus
 [ ] Framework dependency updates (treat as high-risk)
 [ ] Review and update tool allow/deny lists
 [ ] Audit credential issuance logs monthly

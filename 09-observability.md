@@ -44,6 +44,8 @@ Define a consistent attribute namespace for all agent spans. Pick a prefix (e.g.
 |----------|-----------|---------------|
 | **Correlation** | `agent.request.id` | `req-abc123` |
 | | `agent.correlation.id` | `corr-xyz789` |
+| | `agent.traceparent` | W3C traceparent |
+| | `agent.tracestate` | W3C tracestate |
 | **Agent context** | `agent.session.id` | `sess-456` |
 | | `agent.run.id` | `run-789` |
 | | `agent.type` | `remediation` |
@@ -64,6 +66,18 @@ Define a consistent attribute namespace for all agent spans. Pick a prefix (e.g.
 | | `agent.credential.expires_at` | ISO timestamp |
 
 The key principle: every span should carry enough context to answer "which agent, which task, which organization, how long, how much?"
+
+### Propagating Trace Context Across Async Boundaries
+
+Long-running agents cross queues, streams, RPC boundaries, SSE channels, and resume flows. Correlation IDs help, but they are not enough on their own. Propagate **W3C trace context** (`traceparent`, `tracestate`, `baggage`) through:
+
+- task dispatch messages
+- task output events
+- RPC requests/responses
+- action trail records
+- persisted run metadata when a session resumes on a new worker
+
+Without this, you can observe each component but still fail to reconstruct one logical run end-to-end.
 
 ### Instrumenting the Agent Lifecycle
 
@@ -130,6 +144,11 @@ interface ActionTrailEvent {
   sessionId: string;
   runId: string;
   correlationId: string;
+  traceContext?: {
+    traceparent?: string;
+    tracestate?: string;
+    baggage?: string;
+  };
   type:
     | 'tool_call'
     | 'tool_result'
@@ -139,6 +158,10 @@ interface ActionTrailEvent {
     | 'pr_created'
     | 'human_input_requested'
     | 'human_input_received'
+    | 'state_restored'
+    | 'run_resumed'
+    | 'orphan_recovered'
+    | 'policy_denied'
     | 'error'
     | 'budget_warning';
   data: Record<string, unknown>;
@@ -181,6 +204,23 @@ async function emitActionTrail(event: ActionTrailEvent) {
   { "type": "pr_created", "data": { "url": "https://github.com/org/repo/pull/42", "branch": "agent/fix-123" } }
 ]
 ```
+
+---
+
+## Failure Taxonomy and Recovery Events
+
+Don't stop at "success" and "failed." Instrument *why* the run ended and whether recovery happened.
+
+| Category | What It Means | Why It Matters |
+|----------|---------------|----------------|
+| **AUTH_EXPIRED** | Token/session expired and refresh was attempted | Distinguishes credential churn from real task failure |
+| **TRANSIENT** | Network, 429, temporary provider issue | Shows retry pressure and queue amplification |
+| **PERMANENT** | Invalid request, missing permissions, bad repo state | Indicates agent or configuration defect |
+| **TIMEOUT** | Agent or external pipeline exceeded budget | Drives budget and watchdog tuning |
+| **WAITING_INPUT** | Run paused on human checkpoint | Important for UX latency and abandonment tracking |
+| **RECOVERED** | Worker crashed but run resumed/restored successfully | Proves durability design is working |
+
+Emit explicit events for transitions such as `waiting_input_entered`, `waiting_input_timed_out`, `state_restored`, and `orphan_recovered`. Recovery should be visible in traces and dashboards, not inferred from gaps in logs.
 
 ---
 
@@ -288,6 +328,9 @@ All support OpenTelemetry natively — instrument once with OTel SDK, export to 
 | Queue depth | `agent_queue_depth` | Backlog |
 | PRs created | `increase(agent_prs_created_total[24h])` | Output |
 | Credential issuances | `rate(agent_credentials_issued_total[1h])` | Security audit |
+| Waiting-input age | `max(agent_waiting_input_age_seconds)` | Human bottlenecks |
+| Orphan recoveries | `increase(agent_orphan_recoveries_total[24h])` | Durability health |
+| Policy denials | `increase(agent_policy_denials_total[24h])` | Guardrail pressure |
 
 ---
 

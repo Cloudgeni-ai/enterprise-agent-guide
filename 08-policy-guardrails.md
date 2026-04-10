@@ -133,8 +133,8 @@ Define graduated levels of autonomy. A five-tier model covers most use cases:
 | 0 | **Observe** | Read-only. Analyze, summarize, recommend. | N/A |
 | 1 | **Recommend** | Suggest changes but not execute them. | N/A |
 | 2 | **Draft** | Create PRs. No direct execution. | PR review only |
-| 3 | **Sandbox** | Execute in isolated sandbox. | Credential requests |
-| 4 | **Prod (gated)** | Execute in prod with human approval gate. | All production actions |
+| 3 | **Validate** | Execute in isolated sandbox, run plans/what-if/tests, ask for input, update PRs. No live infra mutation. | Credential requests |
+| 4 | **Break-glass Execute** | Exceptional direct execution path outside the default PR-first workflow. | Explicit human approval on every action |
 
 Each tier maps to a set of allowed tools, denied tools, and approval requirements:
 
@@ -149,13 +149,19 @@ const tierPermissions = {
     allowedTools: ['*'],
     deniedTools: ['terraform-apply', 'kubectl-apply'],
   },
-  prod_gated: {
+  validate: {
+    allowedTools: ['*'],
+    deniedTools: ['terraform-apply', 'kubectl-apply', 'terraform-destroy'],
+  },
+  break_glass_execute: {
     allowedTools: ['*'],
     deniedTools: [],
-    requiresApproval: ['production-access'],
+    requiresApproval: ['break-glass-access', 'change-ticket', 'named-approver'],
   },
 };
 ```
+
+For most teams, Tier 4 should not exist on day one. The guide's default posture remains PR-first. If you introduce break-glass execution, build and review it as a different risk class.
 
 ---
 
@@ -555,6 +561,7 @@ RUNTIME (Layer 3)
 [ ] Policy violations have clear escalation paths (block / escalate / warn / audit)
 [ ] Budget limits set per agent type with graceful stop on exceed
 [ ] HITL checkpoints implemented with timeout and fallback
+[ ] If break-glass execution exists, it uses separate credentials, workflow, and audit paths
 ```
 
 ---

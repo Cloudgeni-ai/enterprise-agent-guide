@@ -137,7 +137,7 @@ produce the expected plan output.
 
 ### 2. MCP (Model Context Protocol)
 
-Anthropic's open standard for connecting agents to external tools and data sources. Tools are registered as typed functions served over stdio or HTTP:
+Anthropic's open standard for connecting agents to external tools and data sources. In practice, MCP has grown from "typed tool bridge" into a broader interoperability layer for **tools, resources, prompts, and long-running task flows**. MCP servers are typically exposed over stdio or HTTP transports:
 
 ```typescript
 import { McpServer } from '@modelcontextprotocol/sdk/server';
@@ -153,10 +153,42 @@ server.tool('terraform_plan',
 );
 ```
 
-**Pros**: Standard protocol; typed schemas; supported by multiple LLM providers; growing ecosystem of pre-built servers.
-**Cons**: Less room for rich documentation; tool descriptions are typically one-liners.
+Modern MCP deployments may also include:
 
-### 3. LangChain / LangGraph Tools
+- **Structured outputs** so tool results don't have to be parsed from plain text
+- **Elicitation / user-input flows** for agent questions
+- **Task-oriented operations** for long-running work instead of single request/response calls
+- **Registry metadata** for discovery and installation
+- **Authorization conventions** so clients can negotiate OAuth and related flows consistently
+
+**Pros**: Standard protocol; typed schemas; supported by multiple LLM providers; fast-growing ecosystem of vendor and community servers.
+**Cons**: Still requires operational discipline: version pinning, auth hardening, allowlists, and compatibility testing across clients.
+
+**Operational guidance**:
+
+- Pin both the **server version** and the **MCP spec version** you tested against
+- Treat registry presence as **discoverability**, not trust
+- Prefer an **internal registry or allowlist** for production
+- Treat tool descriptions and annotations as untrusted input until reviewed
+
+### 3. A2A (Agent-to-Agent Protocols)
+
+MCP is not the right abstraction for every integration. When one agent needs to delegate to another autonomous application with its own memory, approvals, artifacts, and lifecycle, use an **agent-to-agent protocol** such as **A2A**.
+
+Use **A2A** when:
+
+- the remote system owns its own credentials and policy enforcement
+- work is long-running and task-oriented
+- responses may include artifacts, status changes, follow-up questions, or resumable work items
+
+Use **MCP** when:
+
+- you are exposing tools, resources, or prompts to a model runtime
+- calls are narrow, typed, and subordinate to the calling agent
+
+In practice, many infra systems use **MCP inside a worker** and **A2A across product boundaries**.
+
+### 4. LangChain / LangGraph Tools
 
 Python-native tool registration with decorators:
 
@@ -175,7 +207,7 @@ agent = create_react_agent(llm, [terraform_plan, ...])
 **Pros**: Simple Python-native API; large ecosystem; works with any LLM.
 **Cons**: Python-only; tool docs limited to docstrings; no built-in isolation.
 
-### 4. OpenAI-Style Function Calling
+### 5. OpenAI-Style Function Calling
 
 Define tools as JSON schemas, let the model generate structured arguments:
 
@@ -207,18 +239,20 @@ const tools = [{
 | **Typed CLI wrappers** | Code comments | Strong | Sandbox-level | Build your own |
 | **Skills as files** | Rich (full markdown) | Via code | Per-file | Growing (Claude, community) |
 | **MCP** | Schema + description | Strong (Zod) | Per-server | Growing fast (vendor-backed) |
+| **A2A** | Agent cards + task schema | Strong | App boundary | Emerging interoperability layer |
 | **LangChain tools** | Docstrings | Python types | None (same process) | Largest |
 | **Function calling** | Schema only | JSON Schema | Your responsibility | Universal |
 
-### Combining Approaches: Skills + MCP + CLIs
+### Combining Approaches: Skills + MCP + A2A + CLIs
 
 These approaches aren't mutually exclusive — they layer together:
 
 - **CLIs** are the foundation. The agent runs `terraform`, `aws`, `git` in its sandbox. This is the raw capability layer.
 - **Skills** define *how* to use those CLIs well. A skill says "when writing Terraform, follow these conventions, validate with plan, max 10 iterations." It's the best-practices layer.
 - **MCP** connects to *live data and APIs*. An MCP server gives the agent access to the Terraform Registry, workspace state, or cloud resource inventory. It's the data layer.
+- **A2A** connects to *other autonomous systems*. A remote remediation agent, ticketing copilot, or approval service can own its own state while still participating in a broader workflow.
 
-HashiCorp's Claude plugin demonstrates all three: CLI tools installed in the environment, skills for Terraform code generation patterns, and an MCP server for live Terraform Registry and Cloud API access.
+HashiCorp's Claude plugin demonstrates three of these layers directly: CLI tools installed in the environment, skills for Terraform code generation patterns, and an MCP server for live Terraform Registry and Cloud API access.
 
 ---
 
@@ -278,6 +312,14 @@ Follow these conventions...
 ```
 
 The agent loads full instructions only when a skill is activated — names and descriptions stay in context for discovery.
+
+For multi-tenant products, resolve skills in **layers**:
+
+1. vendor-curated or platform-curated base skills
+2. organization-level overrides and custom skills
+3. repository-local skills for team-specific workflows
+
+Version the resolved skill set, cache it, and make the active manifest inspectable in logs and UI. This matters as much as the individual skill content.
 
 ### Vendor-Official Skills
 
@@ -395,10 +437,12 @@ Skills are not "just documentation." They are **executable procedures** that ind
 BEFORE INSTALLING ANY SKILL:
 
 [ ] Source is vendor-official or from a known, trusted publisher
+[ ] Registry entry or marketplace presence is treated as discovery, not trust
 [ ] Reviewed SKILL.md for suspicious instructions (fetch URLs, run scripts, disable security)
 [ ] No embedded scripts that execute on install or setup
 [ ] No references to external URLs that fetch content at runtime
 [ ] Pinned to a specific version/commit hash (never "latest")
+[ ] Pinned MCP server image/package/version if the skill depends on MCP
 [ ] If from a marketplace: check scanning results, publisher history, star count
 [ ] If it touches credentials: verify it recommends OIDC/short-lived tokens, not static keys
 [ ] If it can run apply/destroy: ensure it's behind approval gates in your system
@@ -408,6 +452,7 @@ ONGOING:
 [ ] Re-scan periodically (skills can be updated maliciously)
 [ ] Monitor for CVEs in skill dependencies
 [ ] Maintain an internal allowlist of approved skills
+[ ] Mirror critical skills and MCP servers into an internal registry when possible
 [ ] Block unknown publishers by default
 ```
 

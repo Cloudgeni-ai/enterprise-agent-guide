@@ -43,9 +43,9 @@ AI agents can write IaC, fix compliance findings, detect drift, review PRs, and 
 
 ## Core Principles
 
-1. **Agents Never Deploy Directly** — Every infrastructure change flows through a pull request. The agent produces diffs, not deployments.
+1. **Agents Default to PR-First Change Control** — Every infrastructure change flows through a pull request. The agent produces diffs, not deployments. If you support direct execution at all, treat it as a separate break-glass architecture with separate credentials, approval paths, and audit controls.
 2. **Least Privilege by Default** — Agents get the minimum credentials and tool access needed. Privileges are scoped, time-limited, and auditable.
-3. **Observability Is Not Optional** — Every tool call, credential request, and decision point is logged with correlation IDs.
+3. **Observability Is Not Optional** — Every tool call, credential request, and decision point is logged and traced end-to-end.
 4. **Fail Safe, Not Fail Open** — When in doubt, the agent stops and asks a human. Timeouts and policy gates are structural — not suggestions.
 5. **The Agent Is Not Special** — Agent-initiated changes go through the same review, CI, and deployment pipelines as human-initiated changes.
 
@@ -96,6 +96,7 @@ This guide doesn't prescribe a single stack. For each architectural layer, we co
 | **Credential Store** | HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, 1Password |
 | **Change Control** | GitHub Actions, GitLab CI, Azure Pipelines, Atlantis, Spacelift |
 | **Observability** | OpenTelemetry + Grafana, Datadog, Dash0, New Relic |
+| **Interoperability** | MCP, A2A |
 | **Notifications** | Slack, Microsoft Teams, PagerDuty, Opsgenie, email, webhooks |
 | **Scheduling** | Cron (systemd/k8s), Temporal, AWS EventBridge, Azure Timer Triggers |
 | **State Storage** | PostgreSQL, Redis, Azure Blob, S3, SQLite |

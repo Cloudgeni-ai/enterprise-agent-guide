@@ -77,35 +77,40 @@ for await (const message of query({
 
 ### Option 2: OpenAI Codex CLI / Agents SDK
 
-OpenAI offers two levels for building agents:
+OpenAI now offers two complementary layers for building agents:
 
-**Codex CLI** ([github.com/openai/codex](https://github.com/openai/codex)) is an open-source terminal agent (Rust, Apache-2.0) that reads, modifies, and executes code locally. It uses the Responses API under the hood with platform-specific sandboxing (Seatbelt on macOS, Landlock on Linux).
+**Codex CLI** ([github.com/openai/codex](https://github.com/openai/codex)) is an open-source terminal agent (Rust, Apache-2.0) that reads, modifies, and executes code locally. It uses the Responses API under the hood with platform-specific sandboxing (Seatbelt on macOS, Landlock on Linux). It's best when the agent lives inside a workstation or ephemeral repo checkout.
 
-**Agents SDK** ([github.com/openai/openai-agents-python](https://github.com/openai/openai-agents-python)) is the Python framework for building custom agents with tool calling, multi-agent handoffs, and built-in tracing.
+**Agents SDK** ([OpenAI docs](https://platform.openai.com/docs/guides/agents-sdk)) is OpenAI's application framework for custom agents in both **TypeScript and Python**. It supports typed tools, hosted tools, MCP servers, handoffs, session state, tracing, and guardrail hooks. For long-running work, the underlying Responses API also supports server-managed conversation state, background execution, and webhook-style completion flows.
 
-```python
-from agents import Agent, Runner, function_tool
+```typescript
+import { Agent, run, tool } from "@openai/agents";
+import { z } from "zod";
 
-@function_tool
-def terraform_plan(work_dir: str) -> str:
-    """Run terraform plan and return the result."""
-    result = subprocess.run(
-        ["terraform", "plan", "-json", "-no-color"],
-        cwd=work_dir, capture_output=True, text=True,
-    )
-    return result.stdout
+const terraformPlan = tool({
+  name: "terraform_plan",
+  description: "Run terraform plan and return the JSON output",
+  parameters: z.object({ workDir: z.string() }),
+  execute: async ({ workDir }) => {
+    const result = await exec("terraform plan -json -no-color", { cwd: workDir });
+    return result.stdout;
+  },
+});
 
-agent = Agent(
-    name="Remediation Agent",
-    instructions="Fix compliance findings by editing Terraform files.",
-    tools=[terraform_plan],
-)
+const agent = new Agent({
+  name: "Remediation Agent",
+  instructions: "Fix compliance findings by editing Terraform files.",
+  tools: [terraformPlan],
+});
 
-result = await Runner.run(agent, input="Fix the unencrypted S3 bucket")
-print(result.final_output)
+const result = await run(agent, "Fix the unencrypted S3 bucket", {
+  conversationId: existingConversationId,
+});
+
+console.log(result.finalOutput);
 ```
 
-**Raw Responses API**: For maximum control, call `client.responses.create()` directly. The `previous_response_id` parameter maintains reasoning state across turns without resending the full conversation history.
+**Raw Responses API**: For maximum control, call `client.responses.create()` directly. The `previous_response_id` parameter maintains reasoning state across turns without resending the full conversation history. Choose this path when you need custom background-mode orchestration, your own checkpointing model, or very explicit control over tool routing and retries.
 
 ### Option 3: LangChain / LangGraph
 
@@ -230,7 +235,7 @@ All of these implement the same core pattern — LLM → tool call → execute �
 | | Language | LLM Lock-in | Tool System | Session Mgmt | Multi-Agent | Complexity |
 |---|---|---|---|---|---|---|
 | **Claude Agent SDK** | TS, Python | Claude | MCP + built-in tools | Resume by ID | Subagents | Low |
-| **OpenAI Agents SDK** | Python | OpenAI | Function calling + MCP | `previous_response_id` | Handoffs | Low |
+| **OpenAI Agents SDK** | TS, Python | OpenAI | Function tools + hosted tools + MCP | Sessions / `conversationId` / `previous_response_id` | Handoffs | Low |
 | **LangChain/LangGraph** | Python | Any | Decorators + schemas | Checkpoints | Subgraphs | Medium-High |
 | **CrewAI** | Python | Any | Decorators + custom | Flows state | Role-based crews | Medium |
 | **Pydantic AI** | Python | Any | Typed decorators | You build | You build | Low-Medium |
@@ -241,8 +246,9 @@ All of these implement the same core pattern — LLM → tool call → execute �
 
 ### Which One Should You Choose?
 
+- **Start with one agent** unless you can prove you need more. Add handoffs, subagents, or manager-worker patterns only when a single prompt/tool inventory becomes too broad to evaluate reliably or too large to fit comfortably in context.
 - **Claude Agent SDK** if you're building on Claude and want the fastest path to a working agent with built-in file/shell tools, MCP support, and session management.
-- **OpenAI Agents SDK** if you're building on GPT models and want similar convenience with multi-agent handoffs.
+- **OpenAI Agents SDK** if you're building on GPT models and want a current official framework with tracing, sessions, hosted tools, MCP support, and handoffs in either TypeScript or Python.
 - **LangChain/LangGraph** if you need provider flexibility, have complex multi-step workflows with conditional routing, or want the largest ecosystem of pre-built integrations.
 - **CrewAI** if your architecture is multi-agent (e.g., a scanning agent hands off to a remediation agent, which hands off to a review agent) and you want role-based orchestration.
 - **Pydantic AI** if you want type-safe, validated outputs with minimal framework overhead — especially good for infrastructure agents where structured data matters.
@@ -677,7 +683,12 @@ type TaskType = keyof typeof TASK_REGISTRY;
 
 Infrastructure agent sessions aren't like chat sessions. They can last hours or days (waiting for PR review or pipeline completion), span multiple worker instances, and resume days later with follow-up questions.
 
-The key optimization: **keep the LLM agent process alive between turns** instead of restarting for every message.
+The right abstraction is a **session/run split**:
+
+- **Session** = the long-lived work item: conversation history, policy context, visibility rules, durable metadata
+- **Run** = one execution attempt on one worker: trace context, credentials, temp workspace, and persistence artifacts
+
+If the same worker stays healthy, **keeping the agent process alive between turns** is a useful optimization. But correctness must not depend on a live process. A new worker should be able to restore enough state to continue safely.
 
 ```mermaid
 sequenceDiagram
@@ -723,6 +734,27 @@ async function restoreGitState(workDir: string, sessionId: string, storage: Blob
 ```
 
 Store bundles and agent session files in blob storage (S3, Azure Blob) and restore in parallel when a session migrates to a new worker.
+
+---
+
+## Context Management Is a Runtime Concern
+
+Teams often talk about "context" as if it were only a retrieval problem. It isn't. Runtime quality depends on how you **assemble, trim, checkpoint, and resume** context over time.
+
+Treat context as three separate layers:
+
+- **Working context** — recent messages, active plan, latest tool results
+- **Durable context** — session state, checkpoints, git bundles, run artifacts
+- **Reusable context** — cached prompt prefixes, policy docs, skill docs, serialized resource summaries
+
+Good runtimes do four things well:
+
+1. **Compact old turns** instead of replaying every prior tool result forever
+2. **Promote stable facts** into memory/checkpoints, not transient reasoning
+3. **Keep static prefixes cache-friendly** (policies, skills, repo instructions)
+4. **Resume from identifiers** (`session_id`, `conversationId`, `previous_response_id`, checkpoint keys) rather than blindly reconstructing giant transcripts
+
+This matters as much as retrieval quality. A mediocre retrieval stack with disciplined context management will usually outperform a great retrieval stack that keeps appending tokens until the window collapses.
 
 ---
 
