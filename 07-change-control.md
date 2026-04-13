@@ -12,6 +12,8 @@ Agent writes code → Agent creates PR → CI validates → Human reviews → CI
 
 Treat this as a hard architectural constraint, not a guideline.
 
+If you support emergency direct execution at all, treat it as a **separate break-glass system** outside this default path. It should not share the same worker assumptions, credentials, or risk posture as the PR-first flow.
+
 ---
 
 ## Why PR-Based Change Control
@@ -99,6 +101,28 @@ async function validateAndCreatePR(
   });
 }
 ```
+
+---
+
+## The Proposal Plane
+
+Before a PR exists, users still need to understand what the agent *thinks* it is changing. Keep a structured proposal model alongside raw file diffs.
+
+Useful proposal artifacts include:
+
+- planned resources and relationships
+- estimated fixed and usage-based cost impact
+- validation status and iteration count
+- ground-truth snapshots of touched files for diff reconciliation
+
+This enables product capabilities that materially improve trust:
+
+- graph overlays instead of reading raw Terraform plan JSON
+- cost previews before a branch or PR is finalized
+- stable UI state across reconnects and worker restarts
+- cleaner human review because "intent" is separated from "transcript"
+
+In other words: don't make the PR description or chat transcript carry the entire review burden.
 
 ---
 
@@ -458,6 +482,7 @@ Encode safety rules directly into the agent's system prompt:
    with full documentation of remaining drift
 7. NEVER modify files outside the repository's IaC directories
 8. ALWAYS commit with a descriptive message referencing the finding
+9. If break-glass execution exists in your platform, it MUST use a separate workflow and credentials
 ```
 
 ---

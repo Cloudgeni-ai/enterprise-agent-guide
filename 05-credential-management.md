@@ -234,9 +234,11 @@ Every agent task should start with the minimum credential scope. Most agent oper
 | Code analysis | Read repository files, check syntax | **Git read** only |
 | Cost analysis | Query billing APIs, describe resources | **Read-only** billing + describe |
 | Remediation | Write Terraform files, create branch, open PR | **Git write** + read-only cloud |
-| Live remediation | All of the above + `terraform apply` | **Write** cloud (rare, gated) |
+| Break-glass live execution | Exceptional direct action outside the default PR-first path | **Separate write** cloud credentials (rare, isolated, heavily audited) |
 
 Notice that even remediation — fixing a compliance finding — typically only needs **git write** permissions. The agent edits code and opens a PR. It doesn't need cloud write access because CI/CD handles the apply. This is the safest and most common pattern.
+
+If you support direct execution at all, make it a **different architecture**, not just a wider scope on the same credential. Separate roles, separate approval flow, separate audit trail, and ideally a separate worker pool.
 
 ### Make Scope Selection Easy
 

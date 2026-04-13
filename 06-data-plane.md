@@ -201,6 +201,32 @@ function serializeFindingForAgent(finding: ComplianceFinding): string {
 
 ---
 
+### Step 5: Preserve Ground Truth and Proposal State
+
+The data plane shouldn't only answer "what exists?" It should also preserve:
+
+- **Discovered truth** — what the cloud and scanners say exists
+- **Workspace ground truth** — the exact file contents/state the agent started from
+- **Proposed truth** — the structured change the agent intends to make
+
+That third category is easy to miss. For infrastructure agents, proposed truth often includes:
+
+- planned resources and relationships
+- cost deltas for creates/deletes
+- validation artifacts (`plan`, `what-if`, policy checks)
+- reconciled file-change snapshots even before a PR exists
+
+Persist these separately from the raw chat transcript. They power better UIs, more reliable resume behavior, and stronger review flows:
+
+- graph overlays instead of raw JSON blobs
+- cost previews before merge
+- diff reconciliation when the agent edited files through tools
+- deterministic recovery after worker restarts
+
+Not all useful context belongs in the prompt. Some context should stay **queryable**, **renderable**, and **versioned** outside the model.
+
+---
+
 ## Why This Matters for Agent Quality
 
 Pre-built context doesn't just save tokens — it changes what agents can do.
