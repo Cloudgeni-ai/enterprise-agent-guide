@@ -1,472 +1,231 @@
 # Chapter 4: Sandboxed Execution
 
-> How to isolate agent workloads so a compromised agent can't destroy your infrastructure.
+> How to isolate agent workloads so a compromised or confused agent cannot harm the wider environment.
 
 ---
 
-## Why You Need Sandboxing
+## Why Sandboxing Matters
 
-Infrastructure agents execute code, run CLI tools, and interact with cloud APIs. If the LLM is manipulated (via prompt injection, hallucination, or a malicious skill), the blast radius equals the agent's access level.
+Agents execute code, parse files, call APIs, browse web apps, and read untrusted content. Prompt injection, bad tool descriptions, malicious documents, or model mistakes can turn a helpful agent into an execution path for data exfiltration or unwanted actions.
 
-Without sandboxing:
-- Agent can access the host filesystem (your secrets, other tenants' data)
-- Agent can make network calls to arbitrary endpoints
-- Agent can escalate privileges via the host OS
-- A crash can take down the whole system
+The sandbox boundary should limit:
 
-Sandboxing is your fallback when the policy layer fails. Even if prompt rules are bypassed, the sandbox limits damage.
+- filesystem access
+- network access
+- credentials
+- process lifetime
+- CPU, memory, and disk use
+- reachable tools
+- reachable tenant data
+- side effects in external systems
 
----
-
-## Sandboxing Spectrum
-
-```
-Less Isolation                                         More Isolation
-─────────────────────────────────────────────────────────────────
-  Process      Container    Container +      MicroVM      Full VM
-  (Node.js     (Docker)     Network          (Firecracker) (EC2/Azure
-   subprocess)              Policies                       VM)
-
-  Fast          Fast        Medium           Fast          Slow
-  No isolation  Good        Very good        Excellent     Maximum
-  Free          Free        Free             Complex       Expensive
-```
-
-For most infrastructure agents, **container + network policies** is the right tradeoff.
+Sandboxing is not a replacement for authorization. It is a second boundary after policy and before tool execution.
 
 ---
 
-## Option 1: Docker Containers (Self-Managed)
+## Isolation Levels
 
-The most common approach. Run each agent task in an ephemeral container.
-
-### Architecture
-
-```mermaid
-graph TB
-    subgraph "Host Machine"
-        WORKER[Worker Process] -->|docker run| C1[Agent Container 1<br/>ephemeral]
-        WORKER -->|docker run| C2[Agent Container 2<br/>ephemeral]
-
-        C1 -->|exits| CLEANUP1[Container removed]
-        C2 -->|exits| CLEANUP2[Container removed]
-    end
-
-    C1 -.->|limited network| CLOUD[Cloud APIs]
-    C2 -.->|limited network| GIT[Git Provider]
+```
+Process sandbox
+  < container
+  < microVM
+  < managed isolated runtime
+  < separate account/subscription/project
 ```
 
-### Docker Compose Example
+| Level | Best For | Limits |
+|-------|----------|--------|
+| **Process sandbox** | Local development, trusted internal tools | Weak isolation |
+| **Container** | Most worker-hosted enterprise agents | Kernel shared with host |
+| **MicroVM** | Higher-risk code execution and tenant isolation | More platform complexity |
+| **Managed code interpreter** | Data analysis and generated code | Provider constraints |
+| **Managed browser runtime** | Web automation without local browser risk | Session and cost limits |
+| **Separate cloud boundary** | High-regulation or high-risk tenants | Operational overhead |
 
-```yaml
-# docker-compose.yml — Agent worker with sandbox
-services:
-  task-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - QUEUE_NAME=agent-tasks
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock  # For spawning sandbox containers
-    networks:
-      - internal
+Use stronger isolation as data sensitivity and tool power increase.
 
-  # Each agent task spawns one of these
-  agent-sandbox:
-    build:
-      context: .
-      dockerfile: Dockerfile.sandbox
-    profiles: ["sandbox"]  # Not started by default
-    read_only: true         # Read-only filesystem
-    tmpfs:
-      - /tmp:size=1G        # Writable temp space
-      - /workspace:size=5G  # Git workspace
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_RAW             # For DNS resolution
-    mem_limit: 4g
-    cpus: 2
-    pids_limit: 256
-    networks:
-      - sandbox-net
+---
 
-networks:
-  internal:
-  sandbox-net:
-    driver: bridge
-    internal: false  # Allow outbound for git/cloud APIs
-```
+## Default Sandbox Contract
 
-### Dockerfile for Agent Sandbox
+A production sandbox should provide:
+
+- clean working directory per run
+- no inherited developer credentials
+- no persistent home directory unless explicitly mounted
+- allowlisted tools and package managers
+- short-lived scoped credentials injected at runtime
+- egress controls
+- blocked metadata endpoints
+- resource limits
+- run timeout
+- full command and tool-call logging
+- artifact extraction after completion
+
+---
+
+## Container Pattern
+
+Containers are the default for many enterprise workers.
 
 ```dockerfile
 FROM node:22-slim
 
-# Install IaC tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl unzip jq ca-certificates \
+    ca-certificates curl git jq python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Terraform
-RUN curl -fsSL https://releases.hashicorp.com/terraform/1.9.0/terraform_1.9.0_linux_amd64.zip \
-    -o /tmp/terraform.zip && unzip /tmp/terraform.zip -d /usr/local/bin/ && rm /tmp/terraform.zip
-
-# Azure CLI (if needed)
-RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
-
-# Non-root user
-RUN useradd -m -s /bin/bash agent
+RUN useradd -m -u 10001 agent
 USER agent
 WORKDIR /workspace
 
-# No long-lived credentials baked in
-# Credentials are injected at runtime via the credential broker
+ENV NODE_ENV=production
+CMD ["node", "/app/worker.js"]
 ```
 
-### Pros & Cons
-
-| Pros | Cons |
-|------|------|
-| Full control over environment | You manage the infrastructure |
-| No cold start (images pre-pulled) | Docker socket access is a security concern |
-| Works anywhere Docker runs | Container orchestration complexity |
-| Easy to debug locally | Need to manage image updates |
-
----
-
-## Option 2: Modal (Serverless Containers)
-
-[Modal](https://modal.com) provides serverless container execution with sub-second cold starts. Excellent for bursty agent workloads.
-
-### Architecture
-
-```mermaid
-graph LR
-    API[API Server] -->|dispatch| MODAL[Modal Function]
-    MODAL -->|runs in| SANDBOX[Ephemeral Container<br/>isolated network<br/>auto-scaled]
-    SANDBOX -->|results| API
-```
-
-### Implementation
-
-```python
-# modal_worker.py
-import modal
-
-app = modal.App("infra-agent-worker")
-
-# Define the container image
-agent_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "curl", "unzip", "jq")
-    .run_commands(
-        "curl -fsSL https://releases.hashicorp.com/terraform/1.9.0/"
-        "terraform_1.9.0_linux_amd64.zip -o /tmp/tf.zip",
-        "unzip /tmp/tf.zip -d /usr/local/bin/",
-    )
-    .pip_install("anthropic", "redis", "httpx")
-)
-
-@app.function(
-    image=agent_image,
-    timeout=30 * 60,        # 30 min max
-    memory=4096,             # 4GB RAM
-    cpu=2.0,
-    secrets=[modal.Secret.from_name("agent-redis-credentials")],
-    # Network: Modal handles isolation automatically
-)
-async def run_agent_task(task_payload: dict):
-    """Execute a single agent task in an isolated Modal container."""
-    import redis
-    import anthropic
-
-    # Connect to Redis for event streaming
-    r = redis.from_url(os.environ["REDIS_URL"])
-
-    # Run the agent
-    client = anthropic.Anthropic()
-    # ... agent execution logic ...
-
-    # Emit completion event
-    r.xadd(f"task:run:{task_payload['runId']}", {
-        "type": "completed",
-        "data": json.dumps(result),
-    })
-```
+Dispatch pattern:
 
 ```typescript
-// Dispatch from Node.js API server
-async function dispatchToModal(task: AgentTask) {
-  // Modal provides a REST API to trigger functions
-  const response = await fetch('https://your-app--run-agent-task.modal.run', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${MODAL_TOKEN}`,
-    },
-    body: JSON.stringify(task.payload),
-  });
-}
+await sandbox.run({
+  image: "enterprise-agent-worker:2026-05-08",
+  command: ["node", "/app/run-agent.js"],
+  env: {
+    RUN_ID: run.id,
+    POLICY_DIGEST: policy.digestId,
+  },
+  secrets: await credentialBroker.issueForRun(run.id),
+  limits: {
+    timeoutMs: 15 * 60_000,
+    memoryMb: 2048,
+    cpu: 2,
+  },
+  networkPolicy: "restricted-egress",
+});
 ```
 
-### Pros & Cons
-
-| Pros | Cons |
-|------|------|
-| Zero infrastructure management | Vendor dependency |
-| Auto-scaling (0 to N) | Cold starts (~2s first call) |
-| Pay-per-second billing | Requires Python SDK for config |
-| Built-in secrets management | Egress costs |
-| GPU support for ML workloads | Less control over networking |
+The worker image should contain stable tool versions. Avoid installing tools dynamically inside the run unless the package source is pinned and policy-approved.
 
 ---
 
-## Option 3: Azure Container Apps Jobs
+## Network Controls
 
-[Azure Container Apps Jobs](https://learn.microsoft.com/en-us/azure/container-apps/jobs) run containers on-demand with managed identity. Ideal for Azure-native architectures.
+Most agent escapes are data movement problems. Restrict egress.
 
-### Architecture
+Typical allowlist:
 
-```mermaid
-graph LR
-    API[API Server] -->|trigger job| ACA[Azure Container<br/>Apps Job]
-    ACA -->|pulls image| ACR[Azure Container<br/>Registry]
-    ACA -->|runs in| CONTAINER[Ephemeral Container<br/>managed identity<br/>isolated]
-    CONTAINER -->|results via Redis| API
-```
+- your API gateway
+- approved identity provider endpoints
+- approved tool/MCP endpoints
+- object storage for artifacts
+- package registries only when needed
+- model provider endpoint
 
-### Implementation
+Always block:
 
-```typescript
-// Dispatch — trigger an Azure Container App Job
-import { ContainerAppsClient } from '@azure/arm-appcontainers';
-import { DefaultAzureCredential } from '@azure/identity';
+- cloud metadata endpoints such as `169.254.169.254`
+- tenant-private networks unless explicitly required
+- arbitrary outbound SMTP
+- unreviewed webhook endpoints
+- public paste/file-sharing domains
 
-async function dispatchToContainerApp(task: AgentTask) {
-  const client = new ContainerAppsClient(new DefaultAzureCredential(), SUBSCRIPTION_ID);
-
-  await client.jobs.beginStart(
-    RESOURCE_GROUP,
-    JOB_NAME,
-    {
-      template: {
-        containers: [{
-          name: 'agent-worker',
-          image: `${ACR_NAME}.azurecr.io/agent-worker:latest`,
-          env: [
-            { name: 'TASK_ID', value: task.id },
-            { name: 'TASK_PAYLOAD', value: JSON.stringify(task.payload) },
-            { name: 'REDIS_URL', secretRef: 'redis-url' },
-          ],
-          resources: { cpu: 2, memory: '4Gi' },
-        }],
-      },
-    }
-  );
-}
-```
-
-```yaml
-# Azure Container App Job definition (Bicep)
-resource agentJob 'Microsoft.App/jobs@2024-03-01' = {
-  name: 'agent-worker-job'
-  location: location
-  identity: {
-    type: 'SystemAssigned'  # Managed Identity — no stored credentials
-  }
-  properties: {
-    environmentId: containerAppEnv.id
-    configuration: {
-      triggerType: 'Manual'   # Triggered by API call
-      replicaTimeout: 1800    # 30 min max
-      replicaRetryLimit: 1
-      secrets: [
-        { name: 'redis-url', value: redisConnectionString }
-      ]
-    }
-    template: {
-      containers: [
-        {
-          name: 'agent-worker'
-          image: '${acrName}.azurecr.io/agent-worker:latest'
-          resources: { cpu: json('2.0'), memory: '4Gi' }
-        }
-      ]
-    }
-  }
-}
-```
-
-### Pros & Cons
-
-| Pros | Cons |
-|------|------|
-| Managed Identity (no stored credentials) | Azure-only |
-| Auto-scaling to zero | ~10s cold start |
-| Integrated with Azure networking | Limited customization |
-| Built-in monitoring via Azure Monitor | Job orchestration is basic |
-| VNET integration for private resources | Image pull time adds to startup |
+For browser agents, route traffic through a proxy that logs domains and enforces policy.
 
 ---
 
-## Option 4: AWS Lambda + ECS Tasks
+## Code Execution
 
-For AWS-native architectures, use Lambda for short tasks and ECS Fargate for longer ones.
+Code interpreters are useful for data analysis, transformation, charting, and validation. Treat generated code as untrusted.
 
-```typescript
-// Short tasks (<15min): Lambda
-import { Lambda } from '@aws-sdk/client-lambda';
+Controls:
 
-async function dispatchToLambda(task: AgentTask) {
-  const lambda = new Lambda();
-  await lambda.invoke({
-    FunctionName: 'agent-worker',
-    InvocationType: 'Event', // Async
-    Payload: JSON.stringify(task.payload),
-  });
-}
+- no ambient credentials
+- separate input and output directories
+- read-only source mounts unless edits are required
+- package install controls
+- CPU, memory, disk, and wall-clock limits
+- output-size limits
+- artifact malware scanning for uploaded/generated files
+- redaction before trace/log emission
 
-// Long tasks (>15min): ECS Fargate
-import { ECS } from '@aws-sdk/client-ecs';
-
-async function dispatchToECS(task: AgentTask) {
-  const ecs = new ECS();
-  await ecs.runTask({
-    cluster: 'agent-cluster',
-    taskDefinition: 'agent-worker',
-    launchType: 'FARGATE',
-    overrides: {
-      containerOverrides: [{
-        name: 'agent-worker',
-        environment: [
-          { name: 'TASK_ID', value: task.id },
-          { name: 'TASK_PAYLOAD', value: JSON.stringify(task.payload) },
-        ],
-      }],
-    },
-    networkConfiguration: {
-      awsvpcConfiguration: {
-        subnets: [PRIVATE_SUBNET],
-        securityGroups: [AGENT_SG],
-      },
-    },
-  });
-}
-```
+Managed options include Amazon Bedrock AgentCore Code Interpreter and Microsoft Foundry Code Interpreter. They reduce hosting work, but you still need tenant authorization, data classification, and retention rules around what you upload.
 
 ---
 
-## Option 5: Kubernetes Jobs
+## Browser Automation
 
-Maximum control. Run agent tasks as Kubernetes Jobs with pod security policies.
+Browser tools are powerful because they can operate web applications that lack APIs. They are risky because a web page can inject instructions, hide content, or trigger unexpected actions.
 
-```yaml
-# agent-job.yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: agent-task-${TASK_ID}
-  namespace: agent-workers
-spec:
-  ttlSecondsAfterFinished: 300  # Clean up after 5 min
-  backoffLimit: 1
-  template:
-    spec:
-      serviceAccountName: agent-worker  # RBAC-scoped
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: agent
-          image: registry.example.com/agent-worker:latest
-          resources:
-            requests: { cpu: "1", memory: "2Gi" }
-            limits: { cpu: "2", memory: "4Gi" }
-          env:
-            - name: TASK_PAYLOAD
-              value: "${TASK_PAYLOAD}"
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: agent-secrets
-                  key: redis-url
-      restartPolicy: Never
-      # Network policy applied at namespace level
-```
+Controls:
 
-```yaml
-# Network policy: restrict agent egress
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: agent-egress
-  namespace: agent-workers
-spec:
-  podSelector: {}
-  policyTypes: [Egress]
-  egress:
-    - to:
-        - ipBlock: { cidr: 0.0.0.0/0 }  # Allow outbound
-      ports:
-        - port: 443    # HTTPS (git, cloud APIs)
-        - port: 6379   # Redis
-    - to:
-        - namespaceSelector:
-            matchLabels: { name: kube-system }
-      ports:
-        - port: 53     # DNS
-          protocol: UDP
-```
+- use a managed or isolated browser runtime
+- start with a clean profile per run
+- disable password managers and persistent cookies by default
+- record page URL, title, and action summaries
+- require confirmation before submit, purchase, send, delete, or permission changes
+- restrict domains
+- capture screenshots for audit when policy permits
+- never expose raw session cookies to the model
+
+Amazon Bedrock AgentCore Browser is one managed option for cloud-hosted browser automation. For self-hosted browser work, use Playwright inside a locked-down container or microVM.
 
 ---
 
-## Comparison Matrix
+## File Handling
 
-| Feature | Docker | Modal | Azure Container Apps | AWS Lambda/ECS | Kubernetes |
-|---------|--------|-------|---------------------|----------------|------------|
-| **Cold start** | ~0s (warm) | ~2s | ~10s | Lambda: ~1s, ECS: ~30s | ~5-30s |
-| **Max runtime** | Unlimited | 24h | 24h | Lambda: 15m, ECS: unlimited | Unlimited |
-| **Isolation** | Container | Container + network | Container + VNET | Lambda: microVM | Pod + network policy |
-| **Scaling** | Manual | Automatic | Automatic | Automatic | HPA/KEDA |
-| **Cost model** | Fixed | Per-second | Per-second | Per-request/second | Cluster + pod |
-| **Managed identity** | DIY | Secrets mgmt | Native | IAM roles | Service accounts |
-| **GPU support** | Yes | Yes | No | No (Lambda) | Yes |
-| **Local dev** | Native | Modal CLI | Local emulator | SAM/LocalStack | Minikube/Kind |
-| **Best for** | Dev/small scale | Bursty, serverless | Azure-native | AWS-native | Multi-cloud, full control |
+Agents often process PDFs, spreadsheets, exports, images, and archives.
 
----
+Rules:
 
-## Network Egress Controls
+- scan uploaded files before opening
+- unpack archives into size-limited directories
+- reject symlinks and path traversal during extraction
+- convert files with sandboxed tools
+- preserve original files separately from generated outputs
+- track provenance for every artifact
+- enforce document ACLs before retrieval
 
-Regardless of sandbox technology, restrict outbound network access:
-
-```
-ALLOW:
-  ├── Git providers (github.com, gitlab.com, dev.azure.com)
-  ├── Cloud APIs (*.amazonaws.com, *.azure.com, *.googleapis.com)
-  ├── IaC registries (registry.terraform.io)
-  ├── Your Redis/message bus
-  └── DNS resolution
-
-DENY:
-  ├── Internal networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-  ├── Metadata endpoints (169.254.169.254)  ← CRITICAL
-  ├── Other tenants' resources
-  └── Everything else by default
-```
-
-> **Critical**: Always block cloud metadata endpoints (169.254.169.254). A compromised agent hitting the metadata endpoint can steal instance credentials and escalate privileges.
+For sensitive documents, prefer extracting only the relevant text slices instead of giving the agent the entire file.
 
 ---
 
-## Next Chapter
+## Managed Runtime Options
 
-[Chapter 5: Credential Management →](./05-credential-management.md)
+| Option | Strengths | Watch Out For |
+|--------|-----------|---------------|
+| **Amazon Bedrock AgentCore Runtime** | Managed serverless runtime, isolated sessions, long-running agents, identity, observability, MCP/A2A support | AWS platform fit, feature availability |
+| **Microsoft Foundry Agent Service hosted agents** | Azure-managed hosting for code-based agents, identity and RBAC integration | Preview/region status for hosted-agent features |
+| **Azure Container Apps Jobs** | Container jobs with Azure networking and managed identity | You own agent runtime semantics |
+| **AWS ECS Fargate / Lambda** | Managed AWS compute with IAM integration | Lambda duration limits; ECS orchestration work |
+| **Kubernetes Jobs** | Maximum portability and control | You own cluster security and operations |
+| **Modal / serverless containers** | Fast iteration and bursty workloads | Vendor-specific runtime and networking model |
+
+Choose the runtime based on data boundary, identity integration, task duration, tool needs, and operational ownership.
+
+---
+
+## Resource Limits
+
+Set budgets per task type.
+
+| Task Type | Timeout | Memory | Network | Notes |
+|-----------|---------|--------|---------|-------|
+| Document summary | 5 min | 1 GB | docs + model | Low side-effect risk |
+| Data analysis | 30 min | 4-16 GB | storage + model | Watch output size and PII |
+| Ticket drafting | 10 min | 1 GB | ticket + docs + model | Draft-only default |
+| Browser workflow | 30 min | 2-4 GB | approved domains | Approval before submit |
+| Code modification | 60 min | 4 GB | repo + package registry | PR-only default |
+
+Budget failures should be explicit: stop, summarize what happened, and ask for continuation if needed.
+
+---
+
+## Design Checklist
+
+- [ ] Sandbox has no ambient developer or host credentials
+- [ ] Every run gets a clean workspace
+- [ ] Network egress is restricted and logged
+- [ ] Metadata endpoints are blocked
+- [ ] Code and browser tools run in isolated environments
+- [ ] High-risk browser submits require confirmation
+- [ ] Artifacts are scanned, tracked, and access-controlled
+- [ ] Resource limits and timeout behavior are defined per task type

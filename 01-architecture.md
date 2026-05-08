@@ -1,55 +1,60 @@
 # Chapter 1: Architecture Overview
 
-> The six planes of a production infrastructure agent system.
+> The six planes of a production enterprise-agent system.
 
 ---
 
 ## The Big Picture
 
-An infrastructure agent system isn't just "an LLM with tools." It's a distributed system where untrusted language model output drives privileged infrastructure operations. Getting the architecture right is the difference between a productivity multiplier and an incident generator.
+An enterprise agent system is not just "an LLM with tools." It is a distributed system where language model output can read sensitive context, call tools, create work artifacts, and sometimes trigger real business actions. The architecture must separate reasoning from authority.
 
-The architecture separates into **six interacting planes**:
+The reference architecture has **six interacting planes**:
 
 ```mermaid
 graph TB
     subgraph "1. Ingestion Plane"
-        A1[Webhooks] --> IP[Signal Router]
-        A2[Schedules] --> IP
-        A3[User Chat] --> IP
-        A4[API Calls] --> IP
+        A1[User chat] --> IP[Signal Router]
+        A2[Webhooks] --> IP
+        A3[Schedules] --> IP
+        A4[API calls] --> IP
+        A5[Queues and events] --> IP
     end
 
     subgraph "2. Policy Plane"
         IP --> PP[Policy Engine]
-        PP --> |Denied| FALLBACK[Human Escalation]
-        PP --> |Allowed| DISPATCH
+        PP -->|Denied| ESC[Human Escalation]
+        PP -->|Allowed| DISPATCH[Task Dispatcher]
     end
 
     subgraph "3. Execution Plane"
-        DISPATCH[Task Dispatcher] --> QUEUE[(Task Queue)]
+        DISPATCH --> QUEUE[(Task Queue)]
         QUEUE --> WORKER[Agent Worker]
-        WORKER --> SANDBOX[Sandboxed Runtime]
+        WORKER --> RUNTIME[Agent Runtime]
+        RUNTIME --> SANDBOX[Sandboxed Tools]
     end
 
     subgraph "4. Integration Plane"
-        SANDBOX --> CREDS[Credential Broker]
-        SANDBOX --> GIT[Git Operations]
-        SANDBOX --> CLOUD[Cloud APIs]
-        SANDBOX --> CICD[CI/CD Pipelines]
+        SANDBOX --> ID[Identity and Credential Broker]
+        SANDBOX --> DOCS[Documents and Knowledge]
+        SANDBOX --> APPS[Business Apps and APIs]
+        SANDBOX --> CODE[Code and Repositories]
     end
 
-    subgraph "5. Change Control Plane"
-        GIT --> PR[Pull Request]
-        PR --> VALIDATE[Validation Pipeline]
-        VALIDATE --> |Pass| READY[Ready for Review]
-        VALIDATE --> |Fail| SANDBOX
+    subgraph "5. Action Control Plane"
+        APPS --> DRAFT[Draft Action]
+        CODE --> PR[Pull Request]
+        DRAFT --> REVIEW[Review and Validation]
+        PR --> REVIEW
+        REVIEW -->|Approved| EXECUTE[Execute or Publish]
+        REVIEW -->|Rejected| RUNTIME
     end
 
     subgraph "6. Observability Plane"
         WORKER -.-> OBS[Traces / Logs / Metrics]
         SANDBOX -.-> OBS
         PP -.-> OBS
-        PR -.-> OBS
+        REVIEW -.-> OBS
+        EXECUTE -.-> OBS
     end
 ```
 
@@ -57,267 +62,215 @@ graph TB
 
 ## Plane 1: Ingestion
 
-How work enters the system. Infrastructure agents respond to multiple signal types:
+Work enters the system from many places. Normalize every signal into a common task envelope before it reaches an agent.
 
 | Signal Source | Example | Trigger Type |
-|--------------|---------|-------------|
-| Webhooks | GitHub PR opened, compliance finding created | Event-driven |
-| Schedules | Daily drift scan, weekly compliance check | Time-driven |
-| User chat | "Fix this S3 bucket policy" | Interactive |
-| API calls | CI/CD pipeline triggers agent review | Programmatic |
-| Alerts | PagerDuty incident, CloudWatch alarm | Reactive |
+|--------------|---------|--------------|
+| User chat | "Summarize this customer escalation and draft next steps" | Interactive |
+| Webhook | Ticket created, contract uploaded, PR opened | Event-driven |
+| Schedule | Daily account review, weekly knowledge refresh | Time-driven |
+| API call | Product workflow invokes a specialist agent | Programmatic |
+| Queue/event stream | CRM event, billing anomaly, support SLA breach | Reactive |
 
-### Architecture Pattern: Signal Router
+### Signal Router Pattern
 
 ```typescript
-// All signals normalize into a common dispatch format
 interface AgentTask {
-  type: 'compliance-remediation' | 'drift-detection' | 'pr-review' | 'chat';
+  type: 'research' | 'draft' | 'review' | 'workflow' | 'support';
   trigger: {
-    source: 'webhook' | 'schedule' | 'user' | 'api' | 'alert';
-    sourceId: string;         // PR number, finding ID, etc.
+    source: 'user' | 'webhook' | 'schedule' | 'api' | 'event';
+    sourceId: string;
     timestamp: string;
   };
   context: {
     organizationId: string;
-    repositoryId?: string;
-    agentSlug: string;        // Which agent handles this
+    workspaceId?: string;
+    userId?: string;
+    agentSlug: string;
     priority: 'low' | 'normal' | 'high' | 'critical';
   };
-  payload: Record<string, unknown>;  // Agent-specific data
+  payload: Record<string, unknown>;
 }
 ```
 
-### Alternatives for Signal Ingestion
-
-| Approach | Good For | Watch Out For |
-|----------|----------|--------------|
-| **Express/Fastify webhooks** | Simple, direct, easy to debug | Single point of failure; need retry handling |
-| **AWS API Gateway + Lambda** | Serverless, auto-scaling | Cold starts; complex local dev |
-| **Azure Event Grid** | Native Azure webhook routing | Vendor lock-in |
-| **Temporal workflows** | Complex multi-step triggers | Operational overhead |
+The router should do deterministic work only: authenticate the caller, load tenant settings, classify the task, attach policy-relevant metadata, and enqueue it. Do not let the router become an implicit agent.
 
 ---
 
 ## Plane 2: Policy
 
-The policy plane gates every action before execution. It decides what agents are allowed to do before they do it.
+The policy plane decides what an agent is allowed to do before execution starts, and again before high-risk tool calls.
 
-### Core Concept: Autonomy Tiers
-
-Not all actions carry equal risk. Define tiers and bind each to explicit permissions:
+### Autonomy Tiers
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Tier 0: OBSERVE           Read-only. Summarize, analyze.    │
-│  ──────────────────────────────────────────────────────────  │
-│  Tier 1: RECOMMEND         Suggest changes. No execution.    │
-│  ──────────────────────────────────────────────────────────  │
-│  Tier 2: DRAFT             Create PRs. No merge/apply.       │
-│  ──────────────────────────────────────────────────────────  │
-│  Tier 3: SANDBOX EXECUTE   Run in isolated environment.      │
-│  ──────────────────────────────────────────────────────────  │
-│  Tier 4: PROD WITH GATES   Execute in prod with approvals.   │
-└──────────────────────────────────────────────────────────────┘
+Tier 0: Observe          Read-only analysis and summaries.
+Tier 1: Recommend        Suggest next steps. No persistent changes.
+Tier 2: Draft            Create drafts, comments, PRs, or proposed API calls.
+Tier 3: Execute with Gate Execute after validation and explicit approval.
+Tier 4: Autonomous       Execute within narrow, pre-approved boundaries.
 ```
 
-### Policy Engine Pattern
+### Policy Decision Shape
 
 ```typescript
 interface PolicyDecision {
   allowed: boolean;
   tier: 0 | 1 | 2 | 3 | 4;
   reason: string;
-  requiredApprovals?: string[];   // Human approvers needed
+  requiredApprovals?: string[];
   constraints?: {
-    maxIterations?: number;       // Prevent runaway loops
-    timeoutMs?: number;           // Hard time limit
-    allowedTools?: string[];      // Tool whitelist
-    deniedTools?: string[];       // Tool blacklist
-    requiresPR?: boolean;         // Must produce a PR
-    requiresValidation?: boolean; // Must pass CI before PR
+    maxTurns?: number;
+    timeoutMs?: number;
+    allowedTools?: string[];
+    deniedTools?: string[];
+    allowedDataScopes?: string[];
+    requiresDraft?: boolean;
+    requiresValidation?: boolean;
+    requiresHumanApproval?: boolean;
   };
 }
-
-function evaluatePolicy(
-  task: AgentTask,
-  orgPolicies: Policy[],
-  agentConfig: AgentConfig
-): PolicyDecision {
-  // 1. Check org-level policies (e.g., "no prod changes without approval")
-  // 2. Check agent-level constraints (e.g., max turns, allowed tools)
-  // 3. Check resource-level rules (e.g., "production namespace = Tier 4")
-  // 4. Return composite decision with most restrictive constraints
-}
 ```
 
-### Policy Sources
-
-Policies can come from multiple places, merged at evaluation time:
-
-```typescript
-// Policy digest: consolidated rules injected into agent context
-interface PolicyDigest {
-  organizationPolicies: string[];    // "Never modify production directly"
-  agentHardRules: string[];          // "Max 10 drift iterations"
-  repositoryConventions: string[];   // "Use modules/ for shared code"
-  complianceFrameworks: string[];    // "SOC2: require encryption at rest"
-}
-```
+Policies come from multiple places: organization policy, tenant configuration, user permissions, data classification, integration scopes, agent definition, and task risk. The effective policy should be visible in each run record.
 
 ---
 
 ## Plane 3: Execution
 
-Where agents actually run. The critical architectural rule:
-
-> **Workers are stateless and never touch the database directly.**
-
-This separation means workers can run anywhere — Docker, Modal, Azure Container Apps, Lambda — and crash without corrupting state.
-
-### Reference Architecture
+The execution plane hosts the model loop and the tools it may call. Keep workers stateless wherever possible.
 
 ```mermaid
 graph LR
-    subgraph "API Server (stateful)"
-        API[REST API] --> DB[(PostgreSQL)]
-        API --> DISPATCH[Task Dispatcher]
-    end
-
-    subgraph "Message Bus"
-        DISPATCH --> QUEUE[(Redis Streams<br/>or SQS/RabbitMQ)]
-    end
-
-    subgraph "Workers (stateless)"
-        QUEUE --> W1[Worker 1]
-        QUEUE --> W2[Worker 2]
-        QUEUE --> W3[Worker N]
-    end
-
-    subgraph "Output"
-        W1 --> OUTPUT[(Output Stream)]
-        W2 --> OUTPUT
-        W3 --> OUTPUT
-        OUTPUT --> API
-    end
+    API[API Server] --> DB[(Control DB)]
+    API --> QUEUE[(Task Queue)]
+    QUEUE --> W1[Worker]
+    QUEUE --> W2[Worker]
+    W1 --> EVENTS[(Run Event Stream)]
+    W2 --> EVENTS
+    EVENTS --> API
 ```
 
-### Why Database Isolation Matters
+### Why Worker Isolation Matters
 
-| If worker touches DB directly... | With DB isolation... |
-|----------------------------------|---------------------|
-| Worker crash can leave inconsistent state | Events are atomic; server reconciles |
-| Need DB credentials in worker environment | Workers only need queue credentials |
-| Scaling workers = scaling DB connections | Queue absorbs load |
-| Testing requires full DB setup | Workers can be tested with mock queues |
+| If workers own state directly | With isolated workers |
+|------------------------------|-----------------------|
+| Crashes can corrupt run state | Server reconciles append-only events |
+| Broad credentials live in worker memory | Workers request short-lived scoped grants |
+| Scaling workers can overload databases | Queues absorb load and backpressure |
+| Debugging depends on local logs | Every run has traceable events |
 
-### Alternatives for Task Queuing
+### Runtime Choices
 
-| Technology | Strengths | Weaknesses | Best For |
-|-----------|-----------|------------|----------|
-| **Redis Streams** | Fast, consumer groups, message persistence, built-in backpressure | Data loss risk if not persisted; memory-bound | Real-time, low-latency dispatch |
-| **BullMQ** (Redis-backed) | Rich job features (retry, delay, priority), Node.js native | Tied to Redis and Node.js | Node.js-centric architectures |
-| **AWS SQS + Lambda** | Serverless, scales to zero, dead-letter queues | 256KB message limit; eventual consistency | AWS-native, bursty workloads |
-| **RabbitMQ** | Flexible routing, mature, battle-tested | Operational overhead; clustering is complex | Complex routing needs |
-| **Temporal** | Durable workflows, built-in retry/timeout, replay | Heavy runtime; learning curve | Long-running, multi-step agent workflows |
-| **PostgreSQL SKIP LOCKED** | No extra infra; ACID guarantees | Polling-based; no pub/sub; limited throughput | Small-scale, single-DB architectures |
+You can run agents in:
+
+- your own workers using OpenAI, Anthropic, LangGraph, CrewAI, Pydantic AI, Mastra, or a direct API loop
+- managed agent platforms such as Amazon Bedrock AgentCore or Microsoft Foundry Agent Service
+- workflow engines such as Temporal when the agent is one step in a larger durable process
+- product-specific runtimes when the agent is embedded in an existing SaaS application
+
+The runtime choice does not remove the need for policy, identity, sandboxing, validation, and audit.
 
 ---
 
 ## Plane 4: Integration
 
-How agents interact with external systems (cloud providers, git, CI/CD). The key principle:
+Agents need access to enterprise systems, but they should not receive broad static secrets. They request scoped capabilities from a broker.
 
-> **The agent never holds credentials. It requests them just-in-time from a credential broker.**
-
-See [Chapter 5: Credential Management](./05-credential-management.md) for the full pattern.
-
-### Integration Points
+Common integration categories:
 
 ```
 Agent Worker
-  ├── Git Operations (clone, branch, commit, push, PR)
-  ├── Cloud APIs (AWS/Azure/GCP via short-lived tokens)
-  ├── CI/CD Pipelines (trigger plan/validate, poll results)
-  ├── Compliance Scanners (Prowler, Checkov, custom)
-  └── Communication (Slack, Teams, email for notifications)
+  |-- Knowledge systems: SharePoint, Google Drive, Confluence, Notion
+  |-- Business systems: Salesforce, ServiceNow, Jira, Zendesk, SAP
+  |-- Messaging: Slack, Teams, email
+  |-- Code systems: GitHub, GitLab, Azure DevOps
+  |-- Data systems: SQL warehouses, BI tools, data catalogs
+  `-- Internal APIs: customer, billing, entitlement, workflow services
 ```
+
+Every integration should define:
+
+- what data the agent may read
+- what actions it may draft
+- what actions it may execute
+- which identity is used: user-delegated, agent identity, or service identity
+- what audit record is emitted
 
 ---
 
-## Plane 5: Change Control
+## Plane 5: Action Control
 
-Every agent action that modifies infrastructure goes through the same change pipeline as human changes. See [Chapter 7: Change Control & GitOps](./07-change-control.md).
+Action control is how proposed work becomes real work. It should be explicit and boring.
 
-### The Golden Rule
+| Action Type | Safer Default | Higher-Risk Mode |
+|-------------|---------------|------------------|
+| External message | Draft for review | Send after policy gate |
+| Ticket update | Comment or proposed update | Direct update in low-risk queues |
+| Code/config change | Pull request | Auto-merge in constrained repos |
+| Business workflow | Approval request | Direct execution with scoped entitlement |
+| Data change | Staged mutation request | Transactional API call with rollback plan |
 
-```
-Agent writes code → Agent creates PR → CI validates → Human reviews → CI applies
-```
-
-**Never**:
-```
-Agent writes code → Agent applies directly to production
-```
+Use deterministic validators before approval where possible: schema checks, linters, tests, policy checks, dry-run APIs, duplicate detection, permission checks, and cost/impact estimates.
 
 ---
 
 ## Plane 6: Observability
 
-Agent actions must be at least as observable as human actions. In practice, they should be *more* observable because agent reasoning is opaque. See [Chapter 9: Observability](./09-observability.md).
+Enterprise agent observability needs more than request logs. You need to reconstruct what happened and why.
 
-### What to Observe
+| Event | Why It Matters |
+|-------|----------------|
+| Task created | Who asked, from where, and with what context |
+| Policy decision | What was allowed or denied |
+| Model call | Prompt version, model, token use, latency |
+| Tool call | Inputs, outputs, duration, and credential scope |
+| Data access | Which records or documents were retrieved |
+| Approval | Who approved, rejected, or changed scope |
+| Final action | What changed in the external system |
 
-| Layer | What to Capture | Why |
-|-------|----------------|-----|
-| **Agent decisions** | Tool calls, reasoning steps, plan generation | Debug incorrect actions |
-| **Policy evaluations** | What was allowed/denied, which rules applied | Audit compliance |
-| **Credential usage** | Token minting, scope, expiry, actual API calls made | Security audit trail |
-| **Infrastructure changes** | Diffs, PR links, pipeline results | Change attribution |
-| **Performance** | Latency, token usage, queue depth, error rates | Cost and reliability |
+Use structured events, OpenTelemetry spans, and an append-only audit trail. Redact sensitive values before they enter logs.
 
 ---
 
-## Putting It Together: End-to-End Flow
-
-Here's a complete flow for a compliance remediation:
+## Example Flow: Support Escalation Agent
 
 ```mermaid
 sequenceDiagram
-    participant Scanner as Compliance Scanner
-    participant API as API Server
-    participant Policy as Policy Engine
-    participant Queue as Task Queue
-    participant Worker as Agent Worker
-    participant Git as Git Provider
-    participant CICD as CI/CD Pipeline
-    participant Human as Engineer
+    participant User
+    participant API
+    participant Policy
+    participant Queue
+    participant Worker
+    participant Broker
+    participant CRM
+    participant Docs
+    participant Review
 
-    Scanner->>API: Finding: S3 bucket missing encryption
-    API->>Policy: Evaluate: can agent remediate?
-    Policy-->>API: Allowed (Tier 2: draft PR, max 5 iterations)
-
-    API->>Queue: Dispatch remediation task
-    Queue->>Worker: Claim task
-
-    Worker->>Worker: Clone repository
-    Worker->>Worker: Analyze finding context
-    Worker->>Worker: Write Terraform fix
-
-    Worker->>Git: Create branch, push changes
-    Worker->>CICD: Trigger terraform plan
-    CICD-->>Worker: Plan output (no drift remaining)
-
-    Worker->>Git: Create Pull Request
-    Worker->>API: Emit completion event
-
-    API->>Human: Notify: PR ready for review
-    Human->>Git: Review and merge
-    CICD->>CICD: terraform apply
+    User->>API: "Draft next steps for escalation #123"
+    API->>Policy: Evaluate task
+    Policy-->>API: Tier 2 allowed, no external send
+    API->>Queue: Enqueue task
+    Queue->>Worker: Start run
+    Worker->>Broker: Request read access
+    Broker-->>Worker: Scoped CRM + docs tokens
+    Worker->>CRM: Read case and account history
+    Worker->>Docs: Retrieve playbook sections
+    Worker->>Worker: Reason and draft response
+    Worker->>Review: Create draft with citations
+    Review-->>User: Human reviews and sends
 ```
+
+The agent never receives broad CRM access, never sends directly, and every data access and draft is traceable.
 
 ---
 
-## Next Chapter
+## Design Checklist
 
-[Chapter 2: Agent Runtime & Orchestration →](./02-agent-runtime.md)
+- [ ] All inbound signals normalize into one task format
+- [ ] Policy is evaluated before the run and before high-risk tools
+- [ ] Workers are stateless or checkpoint through explicit run state
+- [ ] Tools are scoped by capability, not by broad credentials
+- [ ] Draft-review-execute paths are clear for each action type
+- [ ] Observability captures model, tool, policy, data, and approval events
+- [ ] Sensitive data is redacted before logging
