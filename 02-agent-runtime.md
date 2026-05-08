@@ -54,6 +54,8 @@ A production runtime must add:
 
 Managed platforms are useful when you want the provider to handle hosting, identity integration, tool hosting, memory, observability, or scaling. They do not remove the need for your own product policy, tenant authorization, data classification, and action-control model.
 
+The Amazon Bedrock AgentCore and Microsoft Foundry Agent Service notes in this section were checked against official AWS and Microsoft documentation on 2026-05-08.
+
 ### Option 1: Amazon Bedrock AgentCore
 
 [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html) is AWS's agentic platform for building, deploying, and operating agents securely at scale. AWS describes it as framework- and model-flexible: AgentCore can work with open-source frameworks such as CrewAI, LangGraph, LlamaIndex, Google ADK, OpenAI Agents SDK, and Strands Agents, and with foundation models in or outside Amazon Bedrock.

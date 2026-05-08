@@ -10,8 +10,6 @@ Enterprise agents can read knowledge bases, update tickets, analyze documents, p
 
 This guide covers the architecture decisions you need to make when building enterprise agents: runtime selection, tool design, identity, context, policy, observability, testing, UX, and go-live risk controls.
 
-The platform notes for **Amazon Bedrock AgentCore** and **Microsoft Foundry Agent Service / Azure AI Foundry** were checked against official AWS and Microsoft documentation on **2026-05-08**.
-
 ---
 
 ## Who This Is For
