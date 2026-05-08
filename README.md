@@ -118,6 +118,8 @@ Please keep contributions focused on reusable patterns and architecture, not ven
 
 This guide is built by the team at **[Cloudgeni](https://cloudgeni.ai)**.
 
+It started as a generalized rewrite of Cloudgeni's [Infrastructure Agents Guide](https://github.com/Cloudgeni-ai/infrastructure-agents-guide), adapted for enterprise agent systems beyond infrastructure operations.
+
 Every pattern here comes from designing, building, and reviewing production agent systems. We open-sourced it because the same architectural questions keep coming up across enterprise teams.
 
 ---
